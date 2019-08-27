@@ -1,0 +1,8 @@
+
+[ 
+    { 
+        "name": "flask-container", 
+        "imageUri": "313060132730.dkr.ecr.us-east-1.amazonaws.com/gunicorn-flask" 
+    } 
+] 
+ 
