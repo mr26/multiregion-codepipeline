@@ -1,0 +1,9 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: artifact buckets for pipeline
+
+Resources:
+  CodePipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'artifactbucket-mehdi-${AWS::Region}'
+

@@ -1,0 +1,214 @@
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates CI/CD Pipeline which deploy flask api to ECS
+Parameters:
+  codebuildname:
+    Type: String
+    Description: codebuild name
+    Default: cicdflaskbuild
+Resources:
+  newvpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      Tags:
+      - Key: Name
+        Value: flask-project-vpc
+
+  fpig:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: flaskig
+    
+  attachig:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref fpig
+      VpcId: !Ref newvpc
+
+  pubroutetable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref newvpc
+      Tags:
+      - Key: Name
+        Value: flask-pubroutetable
+
+  modpubroutetable:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref pubroutetable
+      GatewayId: !Ref fpig
+
+  pubsubnetflask:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: True
+      VpcId: !Ref newvpc
+      Tags:
+      - Key: Name
+        Value: pubsubnetflas
+
+  pubsubassoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref pubroutetable
+      SubnetId: !Ref pubsubnetflask
+
+  privsubnetflask:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: False
+      VpcId: !Ref newvpc
+      Tags:
+      - Key: Name
+        Value: privsubnetflask
+  
+  privroutetable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref newvpc
+      Tags:
+      - Key: Name
+        Value: flask-privroutetable
+
+  privsubassoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref privroutetable
+      SubnetId: !Ref privsubnetflask
+
+  myeip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: standard
+
+  mynatgateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt myeip.AllocationId
+      SubnetId: !Ref pubsubnetflask
+
+  modprivroutetable:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref privroutetable
+      NatGatewayId: !Ref mynatgateway
+
+  fargateflaskcluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: fargate-flask-cluster
+
+  flaskapitaskdef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions: 
+      - Name: "flask-container"
+        Image: "313060132730.dkr.ecr.us-east-1.amazonaws.com/gunicorn-flask"
+        PortMappings:
+          -
+            ContainerPort: 8000
+            HostPort: 8000
+            Protocol: tcp 
+      NetworkMode: awsvpc
+      Cpu: 512
+      RequiresCompatibilities:
+        - "FARGATE"
+      Memory: 1024
+      ExecutionRoleArn: "arn:aws:iam::313060132730:role/flaskexecutionrole"
+
+  flasknlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: flask-nlb
+      Subnets: 
+        - !Ref pubsubnetflask
+      Type: network
+
+  flasktargetgroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: flasktargetgroup
+      Port: 8000
+      Protocol: TCP
+      TargetType: ip
+      VpcId: !Ref newvpc 
+
+  flasknlblistener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref flasknlb
+      Port: 80
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref flasktargetgroup
+
+  flasksecgrp:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: flasksecgrp
+      GroupDescription: Allow load balancer to send traffic to containers
+      VpcId: !Ref newvpc
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        ToPort: 8000
+        FromPort: 8000
+        CidrIp: 0.0.0.0/0
+
+  flaskservice:
+    Type: AWS::ECS::Service
+    DependsOn: flasknlblistener
+    Properties:
+      Cluster: !Ref fargateflaskcluster
+      DesiredCount: 2
+      LoadBalancers:
+        - ContainerPort: 8000
+          TargetGroupArn: !Ref flasktargetgroup
+          ContainerName: flask-container
+      ServiceName: flaskservice
+      TaskDefinition: !Ref flaskapitaskdef
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref privsubnetflask
+          SecurityGroups:
+            - !GetAtt flasksecgrp.GroupId
+
+  DNSRecordUsWest1:
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      AliasTarget:
+        DNSName: !GetAtt flasknlb.DNSName
+        HostedZoneId: !GetAtt flasknlb.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+      Failover: SECONDARY
+      Name: api.mehdiaws.com
+      Type: A
+      HostedZoneId: Z1HWK4F8YSD5ZA
+      SetIdentifier: flaskdnsrecord-us-west-1
+
+  LoadBalancerParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties: 
+      Name:  flasknlb-dnsname
+      Type: "String"
+      Value: !GetAtt flasknlb.DNSName
+      AllowedPattern: ".*"
+
+

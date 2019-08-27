@@ -1,0 +1,28 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates ECS role and exports the role
+Resources:
+
+  flaskexecutionrole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2008-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "ecs-tasks.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      RoleName: flaskexecutionrole
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy']
+
+  FlaskExecutionRoleParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties:
+      Name:  flaskexecutionrole
+      Type: "String"
+      Value: !GetAtt flaskexecutionrole.Arn
+      AllowedPattern: ".*"
+

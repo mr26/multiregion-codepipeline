@@ -1,0 +1,389 @@
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Creates CI/CD Pipeline which deploy flask api to ECS
+Parameters:
+  codebuildname:
+    Type: String
+    Description: codebuild name
+    Default: cicdflaskbuild
+Resources:
+  newvpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      Tags:
+      - Key: Name
+        Value: flask-project-vpc
+
+  fpig:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+      - Key: Name
+        Value: flaskig
+    
+  attachig:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref fpig
+      VpcId: !Ref newvpc
+
+  pubroutetable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref newvpc
+      Tags:
+      - Key: Name
+        Value: flask-pubroutetable
+
+  modpubroutetable:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref pubroutetable
+      GatewayId: !Ref fpig
+
+  pubsubnetflask:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: True
+      VpcId: !Ref newvpc
+      Tags:
+      - Key: Name
+        Value: pubsubnetflas
+
+  pubsubassoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref pubroutetable
+      SubnetId: !Ref pubsubnetflask
+
+  privsubnetflask:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select
+        - 0
+        - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: False
+      VpcId: !Ref newvpc
+      Tags:
+      - Key: Name
+        Value: privsubnetflask
+  
+  privroutetable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref newvpc
+      Tags:
+      - Key: Name
+        Value: flask-privroutetable
+
+  privsubassoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref privroutetable
+      SubnetId: !Ref privsubnetflask
+
+  myeip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: standard
+
+  mynatgateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt myeip.AllocationId
+      SubnetId: !Ref pubsubnetflask
+
+  modprivroutetable:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      RouteTableId: !Ref privroutetable
+      NatGatewayId: !Ref mynatgateway
+
+  fargateflaskcluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: fargate-flask-cluster
+
+  flaskapitaskdef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions: 
+      - Name: "flask-container"
+        Image: "313060132730.dkr.ecr.us-east-1.amazonaws.com/gunicorn-flask"
+        PortMappings:
+          -
+            ContainerPort: 8000
+            HostPort: 8000
+            Protocol: tcp 
+      NetworkMode: awsvpc
+      Cpu: 512
+      RequiresCompatibilities:
+        - "FARGATE"
+      Memory: 1024
+      ExecutionRoleArn: "arn:aws:iam::313060132730:role/flaskexecutionrole"
+
+  flasknlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: flask-nlb
+      Subnets: 
+        - !Ref pubsubnetflask
+      Type: network
+
+  flasktargetgroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: flasktargetgroup
+      Port: 8000
+      Protocol: TCP
+      TargetType: ip
+      VpcId: !Ref newvpc 
+
+  flasknlblistener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref flasknlb
+      Port: 80
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref flasktargetgroup
+
+  flasksecgrp:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: flasksecgrp
+      GroupDescription: Allow load balancer to send traffic to containers
+      VpcId: !Ref newvpc
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        ToPort: 8000
+        FromPort: 8000
+        CidrIp: 0.0.0.0/0
+
+  flaskservice:
+    Type: AWS::ECS::Service
+    DependsOn: flasknlblistener
+    Properties:
+      Cluster: !Ref fargateflaskcluster
+      DesiredCount: 2
+      LoadBalancers:
+        - ContainerPort: 8000
+          TargetGroupArn: !Ref flasktargetgroup
+          ContainerName: flask-container
+      ServiceName: flaskservice
+      TaskDefinition: !Ref flaskapitaskdef
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref privsubnetflask
+          SecurityGroups:
+            - !GetAtt flasksecgrp.GroupId
+
+  cloudfrontdistro:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: yes
+        Aliases:
+          - api.mehdiaws.com
+        DefaultCacheBehavior:
+          TargetOriginId: cloudfront-flask-api
+          ViewerProtocolPolicy: allow-all
+          ForwardedValues:
+            Cookies:
+              Forward: none
+            QueryString: false
+        Origins:
+          - DomainName: !GetAtt flasknlb.DNSName
+            Id: cloudfront-flask-api
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        ViewerCertificate:
+          AcmCertificateArn: "arn:aws:acm:us-east-1:313060132730:certificate/f981a44d-8ee1-4a77-aac6-f30809dc7912"
+          SslSupportMethod: sni-only
+        CacheBehaviors:
+          - PathPattern: "*"
+            ViewerProtocolPolicy: redirect-to-https
+            TargetOriginId: cloudfront-flask-api
+            ForwardedValues:
+              QueryString: false
+
+  codebuildiamrole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns: ['arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess']
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        -
+          PolicyName: "cicdcodebuild-role"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              -
+                Effect: "Allow"
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*'
+
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+              -
+                Effect: "Allow"
+                Resource:
+                  -  !Sub 'arn:aws:s3:::codepipeline-${AWS::Region}-*/*'
+                Action:
+                  - 's3:GetObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:PutObject'
+                  - 's3:GetObjectVersion'
+                  - 's3:GetBucketAcl'
+                  - 's3:GetBucketLocation'
+
+              -
+                Effect: "Allow"
+                Resource: "*"
+                Action: "s3:*"
+
+  cicdflaskbuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cicdflaskbuild
+      ServiceRole: !Ref codebuildiamrole
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/docker:18.09.0
+        ComputeType: BUILD_GENERAL1_SMALL
+      Source:
+        Type: CODEPIPELINE
+
+  cicdpipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn: flaskservice
+    Properties:
+      Name: cicdpipeline
+      RoleArn: arn:aws:iam::313060132730:role/service-role/AWSCodePipelineServiceRole-us-east-1-ecspipeline
+      ArtifactStores:
+        - Region: us-east-1
+          ArtifactStore:
+            Type: S3
+            Location: artifactbucket-mehdi-us-east-1
+        - Region: us-west-1
+          ArtifactStore:
+            Type: S3
+            Location: artifactbucket-mehdi-us-west-1
+      Stages:
+        -
+          Name: Source
+          Actions:
+            -
+              Name: CodeRepo
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              Configuration:
+                RepositoryName: gunicorn-flask-repo
+                BranchName: master
+              OutputArtifacts:
+                -
+                  Name: SourceOutputArtifact
+        -
+          Name: Build
+          Actions:
+            -
+              Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: 1
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref cicdflaskbuild
+              InputArtifacts:
+                -
+                  Name: SourceOutputArtifact
+              OutputArtifacts:
+                -
+                  Name: BuildOutputArtifact
+        -
+          Name: Deploy
+          Actions:
+            -
+              Name: DeployUSEast1
+              Region: us-east-1
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: ECS
+              Configuration:
+                ClusterName: fargate-flask-cluster
+                ServiceName: flaskservice
+              InputArtifacts:
+                -
+                  Name: BuildOutputArtifact
+            -
+
+              Name: DeployUSWest1
+              Region: us-west-1
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Version: 1
+                Provider: ECS
+              Configuration:
+                ClusterName: fargate-flask-cluster
+                ServiceName: flaskservice
+              InputArtifacts:
+                -
+                  Name: BuildOutputArtifact
+
+
+  DNSRecordUsWest1:
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      AliasTarget:
+        DNSName: !GetAtt cloudfrontdistro.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: true
+      Failover: PRIMARY
+      Name: api.mehdiaws.com
+      Type: A
+      HostedZoneId: Z1HWK4F8YSD5ZA
+      SetIdentifier: flaskdnsrecord-us-east-1
+
+  LoadBalancerParameter:
+    Type: "AWS::SSM::Parameter"
+    Properties: 
+      Name:  flasknlb-dnsname
+      Type: "String"
+      Value: !GetAtt flasknlb.DNSName
+      AllowedPattern: ".*"
+
+
